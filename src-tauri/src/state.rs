@@ -24,6 +24,15 @@ pub struct AppState {
     pub(crate) edit_gate: parking_lot::ReentrantMutex<()>,
     pub(crate) edit_history: parking_lot::Mutex<EditHistory>,
     pub(crate) analysis_write: parking_lot::Mutex<()>,
+    /// The writer a [`Self::writer_session`] shares between its edits, opened
+    /// by the first of them. `None` outside a session.
+    pub(crate) session: parking_lot::Mutex<Option<rbl_db::write::Writer>>,
+    /// How many sessions are open on the thread holding `edit_gate`, so an
+    /// edit can tell "in a session, writer not opened yet" from "no session",
+    /// and only the outermost session closes the writer.
+    session_depth: std::sync::atomic::AtomicUsize,
+    /// Every `Writer::open`, for the tests that count key derivations.
+    writer_opens: std::sync::atomic::AtomicU64,
     pub(crate) backup_progress: parking_lot::Mutex<crate::backups::BackupProgress>,
     pub(crate) backup_sizes: parking_lot::Mutex<crate::backup_sizes::SizeCache>,
     inner: RwLock<Inner>,
@@ -53,6 +62,17 @@ pub struct AppState {
     /// The waveform of each track an analysis is still drawing, by id: what
     /// it has decoded so far, laid out over the whole track.
     drawing: parking_lot::Mutex<HashMap<String, Arc<rbl_analysis::waveform::Waveform>>>,
+}
+
+/// Ends one [`AppState::writer_session`]; the outermost closes its writer.
+struct SessionEnd<'a>(&'a AppState);
+
+impl Drop for SessionEnd<'_> {
+    fn drop(&mut self) {
+        if self.0.session_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            *self.0.session.lock() = None;
+        }
+    }
 }
 
 /// One reversible library operation. Grid edits keep their own history because
@@ -179,6 +199,9 @@ impl AppState {
             edit_gate: parking_lot::ReentrantMutex::new(()),
             edit_history: parking_lot::Mutex::new(EditHistory::default()),
             analysis_write: parking_lot::Mutex::new(()),
+            session: parking_lot::Mutex::new(None),
+            session_depth: std::sync::atomic::AtomicUsize::new(0),
+            writer_opens: std::sync::atomic::AtomicU64::new(0),
             backup_progress: parking_lot::Mutex::new(crate::backups::BackupProgress::default()),
             backup_sizes: parking_lot::Mutex::new(crate::backup_sizes::SizeCache::default()),
             inner: RwLock::new(Inner { next_view_id: 1, generation: 1, ..Inner::default() }),
@@ -279,6 +302,32 @@ impl AppState {
         self.write_then(edit, |_, result| Ok(result))
     }
 
+    /// How many times the library has been opened for writing.
+    #[cfg(test)]
+    pub(crate) fn writer_opens(&self) -> u64 {
+        self.writer_opens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Runs `work` with every library edit in it sharing one writer: the
+    /// first edit opens it, later ones reuse it, and it is closed when the
+    /// outermost session ends, however `work` ends. A track's analysis
+    /// makes ~4 edits, and each open is a ~100 ms `SQLCipher` key derivation.
+    ///
+    /// Scope one session to one track: rekordbox launching mid-run must be
+    /// able to take the file back between tracks. The writer re-checks the
+    /// process gate before each action, so an edit inside a session is
+    /// still refused once rekordbox is running.
+    ///
+    /// Blocking — call from `spawn_blocking`, never from a command body.
+    pub fn writer_session<T>(&self, work: impl FnOnce() -> T) -> T {
+        let _gate = self.edit_gate.lock();
+        self.session_depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Declared after the gate, so dropped before it: the writer is closed
+        // before another thread can start an edit.
+        let _end = SessionEnd(self);
+        work()
+    }
+
     /// Keep the encrypted connection and edit gate through the refresh, so
     /// a small edit neither pays for another key derivation nor races a writer.
     pub fn write_then<T, U>(
@@ -302,15 +351,29 @@ impl AppState {
                 .map_err(|e| rbl_db::DbError::WriteRefused(e.to_string()))?;
         }
         let gate_ms = started.elapsed().as_millis();
-        let mut writer = rbl_db::write::Writer::open(location.clone(), self.backup_dir.clone())?;
-        writer.disable_automatic_backups();
+        // The depth only changes under `edit_gate`, which this thread holds:
+        // a nonzero depth is this thread's own session.
+        let in_session = self.session_depth.load(std::sync::atomic::Ordering::Relaxed) > 0;
+        let reused = if in_session { self.session.lock().take() } else { None };
+        let reused_writer = reused.is_some();
+        let mut writer = if let Some(writer) = reused { writer } else {
+            let mut writer = rbl_db::write::Writer::open(location.clone(), self.backup_dir.clone())?;
+            self.writer_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            writer.disable_automatic_backups();
+            writer
+        };
         let open_ms = started.elapsed().as_millis();
         let result = edit(&mut writer);
         let edit_ms = started.elapsed().as_millis();
         let result = result.and_then(|value| refresh(writer.library(), value));
-        tracing::debug!(gate_ms, open_ms = open_ms - gate_ms,
+        tracing::debug!(gate_ms, open_ms = open_ms - gate_ms, reused_writer,
             edit_ms = edit_ms - open_ms, refresh_ms = started.elapsed().as_millis() - edit_ms,
             "library write phases");
+        // A failed edit drops the writer even inside a session: the next edit
+        // opens afresh rather than trusting a connection that just failed.
+        if in_session && result.is_ok() {
+            *self.session.lock() = Some(writer);
+        }
         result
     }
 

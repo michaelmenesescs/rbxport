@@ -240,80 +240,83 @@ fn analyse_and_save(
     }
     let (analysis, duration_secs) = analyse_file(std::path::Path::new(path), &options, DECODE_CAP_SECS, drawing)?;
 
-    let _edit_guard = state.edit_gate.lock();
-    ensure_analysis_unlocked(state, editor, track_id)?;
-    let _files_guard = state.analysis_write.lock();
-    let location = state.location()?;
-    crate::file_journal::recover(state.backup_dir(), &location)?;
-    state.write(|writer| writer.import_artwork(track_id)).map_err(write_error)?;
-    // The files: where the row already points, or the UUID-derived place
-    // rekordbox uses for desktop-library analysis [OBS: rbl-db::write].
-    let relative = {
-        let current = state.analysis_path_of(library, row, track_id);
-        if current.is_empty() {
-            state.write(|writer| writer.analysis_data_path_for(track_id)).map_err(write_error)?
-        } else {
-            current
-        }
-    };
-    let dat = rbl_anlz::resolve(share, &relative);
-    let existing = [
-        rbl_anlz::Anlz::read(&dat).ok(),
-        rbl_anlz::Anlz::read(&rbl_anlz::sibling(&dat, "EXT")).ok(),
-        rbl_anlz::Anlz::read(&rbl_anlz::sibling(&dat, "2EX")).ok(),
-    ];
-    let beats: Vec<rbl_anlz::Beat> = analysis
-        .tempo
-        .beats
-        .iter()
-        .map(|b| rbl_anlz::Beat { beat_number: b.beat_number, tempo_x100: b.tempo_x100, time_ms: b.time_ms })
-        .collect();
-    let columns: Vec<rbl_anlz::BandColumn> = analysis
-        .waveform
-        .columns
-        .iter()
-        .map(|c| rbl_anlz::BandColumn { low: c.low, mid: c.mid, high: c.high, peak: c.peak })
-        .collect();
-    // `PPTH` as rekordbox writes it in the share tree: `?/<file name>`. The
-    // full path this wrote before is not what rekordbox derives for the
-    // track (issue #323).
-    let files = rbl_anlz::author_with_overview(
-        &rbl_anlz::share_tree_ppth(path),
-        &beats,
-        &columns,
-        analysis.waveform.overview.as_slice().try_into().ok(),
-        rbl_anlz::Existing { dat: existing[0].as_ref(), ext: existing[1].as_ref(), two_ex: existing[2].as_ref() },
-    );
-    // Clamp before narrowing so the conversion cannot truncate.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped into 0..=u32::MAX on the line above")]
-    let to_u32 = |v: f64| v.round().clamp(0.0, f64::from(u32::MAX)) as u32;
-    let bpm_x100 = to_u32(analysis.tempo.bpm * 100.0);
-    let found_key = settings.key.then(|| analysis.key.as_ref().map(detected)).flatten();
-    let detected_key = found_key.as_ref().map(|k| k.classic.clone());
-    let key = detected_key.clone().unwrap_or_else(|| library.keys.name(library.key.get(row).copied().unwrap_or(0)).to_owned());
-    let duration_sec = to_u32(duration_secs);
-    // The whole file was decoded, however long, so this is its length.
-    let length_sec = Some(duration_sec);
+    // Every library edit below shares one writer, closed with the track.
+    state.writer_session(|| {
+        let _edit_guard = state.edit_gate.lock();
+        ensure_analysis_unlocked(state, editor, track_id)?;
+        let _files_guard = state.analysis_write.lock();
+        let location = state.location()?;
+        crate::file_journal::recover(state.backup_dir(), &location)?;
+        state.write(|writer| writer.import_artwork(track_id)).map_err(write_error)?;
+        // The files: where the row already points, or the UUID-derived place
+        // rekordbox uses for desktop-library analysis [OBS: rbl-db::write].
+        let relative = {
+            let current = state.analysis_path_of(library, row, track_id);
+            if current.is_empty() {
+                state.write(|writer| writer.analysis_data_path_for(track_id)).map_err(write_error)?
+            } else {
+                current
+            }
+        };
+        let dat = rbl_anlz::resolve(share, &relative);
+        let existing = [
+            rbl_anlz::Anlz::read(&dat).ok(),
+            rbl_anlz::Anlz::read(&rbl_anlz::sibling(&dat, "EXT")).ok(),
+            rbl_anlz::Anlz::read(&rbl_anlz::sibling(&dat, "2EX")).ok(),
+        ];
+        let beats: Vec<rbl_anlz::Beat> = analysis
+            .tempo
+            .beats
+            .iter()
+            .map(|b| rbl_anlz::Beat { beat_number: b.beat_number, tempo_x100: b.tempo_x100, time_ms: b.time_ms })
+            .collect();
+        let columns: Vec<rbl_anlz::BandColumn> = analysis
+            .waveform
+            .columns
+            .iter()
+            .map(|c| rbl_anlz::BandColumn { low: c.low, mid: c.mid, high: c.high, peak: c.peak })
+            .collect();
+        // `PPTH` as rekordbox writes it in the share tree: `?/<file name>`. The
+        // full path this wrote before is not what rekordbox derives for the
+        // track (issue #323).
+        let files = rbl_anlz::author_with_overview(
+            &rbl_anlz::share_tree_ppth(path),
+            &beats,
+            &columns,
+            analysis.waveform.overview.as_slice().try_into().ok(),
+            rbl_anlz::Existing { dat: existing[0].as_ref(), ext: existing[1].as_ref(), two_ex: existing[2].as_ref() },
+        );
+        // Clamp before narrowing so the conversion cannot truncate.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped into 0..=u32::MAX on the line above")]
+        let to_u32 = |v: f64| v.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+        let bpm_x100 = to_u32(analysis.tempo.bpm * 100.0);
+        let found_key = settings.key.then(|| analysis.key.as_ref().map(detected)).flatten();
+        let detected_key = found_key.as_ref().map(|k| k.classic.clone());
+        let key = detected_key.clone().unwrap_or_else(|| library.keys.name(library.key.get(row).copied().unwrap_or(0)).to_owned());
+        let duration_sec = to_u32(duration_secs);
+        // The whole file was decoded, however long, so this is its length.
+        let length_sec = Some(duration_sec);
 
-    save_analysis_files(state, &location, track_id, &dat, files, bpm_x100, detected_key.as_deref(), &relative, length_sec, editor)?;
-    state.note_analysis(track_id, &relative);
-    let added_first_beat_cue = match beats.first() {
-        Some(first) if settings.first_beat_cue => add_first_beat_cue(state, library, track_id, first.time_ms)?,
-        _ => false,
-    };
+        save_analysis_files(state, &location, track_id, &dat, files, bpm_x100, detected_key.as_deref(), &relative, length_sec, editor)?;
+        state.note_analysis(track_id, &relative);
+        let added_first_beat_cue = match beats.first() {
+            Some(first) if settings.first_beat_cue => add_first_beat_cue(state, library, track_id, first.time_ms)?,
+            _ => false,
+        };
 
-    Ok(AnalysisResultDto {
-        track_id: track_id.to_owned(),
-        analysed: u8::try_from(rbl_db::write::ANALYSED_BY_THIS_APP).unwrap_or(u8::MAX),
-        bpm_x100,
-        key,
-        beats: u32::try_from(beats.len()).unwrap_or(u32::MAX),
-        peak: analysis.peak,
-        duration_sec,
-        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        analysis_path: relative,
-        added_first_beat_cue,
-        detected_key: found_key,
+        Ok(AnalysisResultDto {
+            track_id: track_id.to_owned(),
+            analysed: u8::try_from(rbl_db::write::ANALYSED_BY_THIS_APP).unwrap_or(u8::MAX),
+            bpm_x100,
+            key,
+            beats: u32::try_from(beats.len()).unwrap_or(u32::MAX),
+            peak: analysis.peak,
+            duration_sec,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            analysis_path: relative,
+            added_first_beat_cue,
+            detected_key: found_key,
+        })
     })
 }
 
@@ -511,28 +514,30 @@ fn analyse_key_only(state: &AppState, library: &rbl_index::Library, row: usize, 
     let found_key = rbl_analysis::detect_key(&audio.samples, audio.sample_rate).as_ref().map(detected);
     let key = found_key.as_ref().map(|key| key.classic.clone());
     let _edit_guard = state.edit_gate.lock();
-    ensure_analysis_unlocked(state, editor, track_id)?;
-    // Match full analysis: only use keys already named by this library.
-    // A sparse imported library may not contain every recognised key.
-    let key = if let Some(key) = key {
-        state.write(|writer| {
-            writer.ensure_detected_key(&key)?;
-            writer.set_field(track_id, rbl_db::write::TrackField::Key, &key)?;
-            Ok(Some(key))
-        }).map_err(write_error)?
-    } else { None };
-    Ok(AnalysisResultDto {
-        track_id: track_id.to_owned(),
-        analysed: library.analysed.get(row).copied().unwrap_or(0),
-        bpm_x100: library.bpm_x100.get(row).copied().unwrap_or(0),
-        key: key.unwrap_or_else(|| library.keys.name(library.key.get(row).copied().unwrap_or(0)).to_owned()),
-        beats: 0,
-        peak: audio.samples.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs())),
-        duration_sec: library.length_sec.get(row).copied().unwrap_or(0),
-        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        analysis_path: state.analysis_path_of(library, row, track_id),
-        added_first_beat_cue: false,
-        detected_key: found_key,
+    state.writer_session(|| {
+        ensure_analysis_unlocked(state, editor, track_id)?;
+        // Match full analysis: only use keys already named by this library.
+        // A sparse imported library may not contain every recognised key.
+        let key = if let Some(key) = key {
+            state.write(|writer| {
+                writer.ensure_detected_key(&key)?;
+                writer.set_field(track_id, rbl_db::write::TrackField::Key, &key)?;
+                Ok(Some(key))
+            }).map_err(write_error)?
+        } else { None };
+        Ok(AnalysisResultDto {
+            track_id: track_id.to_owned(),
+            analysed: library.analysed.get(row).copied().unwrap_or(0),
+            bpm_x100: library.bpm_x100.get(row).copied().unwrap_or(0),
+            key: key.unwrap_or_else(|| library.keys.name(library.key.get(row).copied().unwrap_or(0)).to_owned()),
+            beats: 0,
+            peak: audio.samples.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs())),
+            duration_sec: library.length_sec.get(row).copied().unwrap_or(0),
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            analysis_path: state.analysis_path_of(library, row, track_id),
+            added_first_beat_cue: false,
+            detected_key: found_key,
+        })
     })
 }
 
@@ -750,6 +755,52 @@ mod tests {
         assert_eq!(crate::commands::drawing_bytes(last, "bandsDetail", None, None), two.waveform(b"PWV7").unwrap().1,
             "the last snapshot's detail is what the files hold");
         assert_eq!(crate::commands::drawing_bytes(last, "bands", None, None).len(), 3_600, "and a whole overview");
+    }
+
+    /// [`unanalysed_click_track`] with what [`analyse_and_save`] takes
+    /// beside the track: the index, the share root and a grid editor.
+    fn fixture_state(dir: &std::path::Path) -> (AppState, Arc<rbl_index::Library>, std::path::PathBuf, crate::grid::GridEditor) {
+        let (state, location) = unanalysed_click_track(dir);
+        let library = state.library().unwrap();
+        let editor = crate::grid::GridEditor::at(&dir.join("editor"));
+        (state, library, location.share_root, editor)
+    }
+
+    /// Each `Writer::open` is a `SQLCipher` key derivation, ~100 ms on the
+    /// reference library; a track's save makes several edits.
+    #[test]
+    fn analysing_a_track_opens_the_library_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, library, share, editor) = fixture_state(dir.path());
+        let before = state.writer_opens();
+        analyse_and_save(&state, &library, &share, &rbl_db::fixture::track_id(0), rbl_analysis::AnalysisPreset::Rbxport,
+            &AnalysisSettings::default(), &editor, None).expect("analysed");
+        assert_eq!(state.writer_opens() - before, 1);
+    }
+
+    /// rekordbox launching mid-run must be able to take the file back once
+    /// the track in hand is saved, so the session writer goes with it —
+    /// whether the session ended well or not.
+    #[test]
+    fn a_writer_session_ends_with_its_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, library, share, editor) = fixture_state(dir.path());
+        analyse_and_save(&state, &library, &share, &rbl_db::fixture::track_id(0), rbl_analysis::AnalysisPreset::Rbxport,
+            &AnalysisSettings::default(), &editor, None).expect("analysed");
+        assert!(state.session.lock().is_none(), "the writer is closed once the track is saved");
+        let before = state.writer_opens();
+        state.write(|writer| writer.analysis_data_path_for(&rbl_db::fixture::track_id(1))).unwrap();
+        assert_eq!(state.writer_opens() - before, 1, "a later edit opens its own writer");
+
+        let before = state.writer_opens();
+        let failed: Result<(), rbl_db::DbError> = state.writer_session(|| {
+            state.write(|writer| writer.analysis_data_path_for(&rbl_db::fixture::track_id(1)))?;
+            state.write(|writer| writer.analysis_data_path_for(&rbl_db::fixture::track_id(1)))?;
+            Err(rbl_db::DbError::WriteRefused("stopped".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(state.writer_opens() - before, 1, "edits inside one session share a writer");
+        assert!(state.session.lock().is_none(), "a failed session closes its writer too");
     }
 
     #[test]
