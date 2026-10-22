@@ -19,12 +19,12 @@ struct Cost {
     secs_of_audio: f64,
 }
 
-fn one(path: &std::path::Path, options: rbl_analysis::AnalysisOptions) -> Option<Cost> {
+fn one(path: &std::path::Path, options: &rbl_analysis::AnalysisOptions) -> Option<Cost> {
     let started = Instant::now();
     let audio = rbl_audio::decode_mono(path, Some(1800.0)).ok()?;
     let decode = started.elapsed();
     let started = Instant::now();
-    let analysis = rbl_analysis::analyse_with(&audio.samples, audio.sample_rate, options);
+    let analysis = rbl_analysis::analyse_with(&audio.samples, audio.sample_rate, *options);
     let analyse = started.elapsed();
     std::hint::black_box(analysis);
     Some(Cost { decode, analyse, secs_of_audio: audio.duration_secs() })
@@ -49,7 +49,7 @@ fn main() {
     // Single worker: the split between decode and DSP.
     let (mut decode, mut analyse, mut audio, mut n) = (Duration::ZERO, Duration::ZERO, 0.0, 0);
     for path in &paths {
-        if let Some(cost) = one(path, options) {
+        if let Some(cost) = one(path, &options) {
             decode += cost.decode;
             analyse += cost.analyse;
             audio += cost.secs_of_audio;
@@ -72,7 +72,7 @@ fn main() {
                 scope.spawn(|| loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(path) = paths.get(i) else { break };
-                    std::hint::black_box(one(path, options));
+                    std::hint::black_box(one(path, &options));
                 });
             }
         });
