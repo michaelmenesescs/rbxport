@@ -45,7 +45,7 @@ impl MountWatcher {
         let thread = {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                let mut last = mounts();
+                let mut last = snapshot();
                 let mut looked = Instant::now();
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(SLICE.min(interval));
@@ -53,7 +53,7 @@ impl MountWatcher {
                         continue;
                     }
                     looked = Instant::now();
-                    let now = mounts();
+                    let now = snapshot();
                     if now != last {
                         last = now;
                         changed();
@@ -76,6 +76,39 @@ impl MountWatcher {
 impl Drop for MountWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// What the watcher compares between looks: each volume entry with the
+/// device its path resolves to.
+///
+/// The name alone is not enough. macOS creates `/Volumes/NAME` as a plain
+/// directory on the boot volume about 90 ms before the filesystem is mounted
+/// on it [OBS 2026-10-22, `hdiutil attach` of a FAT32 image, 3 of 3], and
+/// longer while a stick that dropped off mid-write is checked first. A look
+/// in that window reported the change, the listing it triggered ran before
+/// the mount and left the stick out, and the next look saw the same names
+/// and reported nothing: scripts' `every device` never listed the stick
+/// again (2026-10-21). The device number changes when the mount lands, so
+/// that is a second change.
+fn snapshot() -> Vec<(PathBuf, u64)> {
+    mounts().into_iter().map(|path| {
+        let device = device_of(&path);
+        (path, device)
+    }).collect()
+}
+
+/// The device a path's filesystem is on, 0 where that cannot be read.
+fn device_of(path: &std::path::Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map_or(0, |meta| meta.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
     }
 }
 
@@ -171,5 +204,21 @@ mod tests {
         let watcher = MountWatcher::start(Duration::from_millis(50), || {});
         std::thread::sleep(Duration::from_millis(120));
         watcher.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_mounted_on_its_directory_is_a_change() {
+        // A mount landing on `/Volumes/NAME` after the directory appeared:
+        // same name, another filesystem. `/dev` is one on macOS and Linux.
+        let dir = tempfile::tempdir().unwrap();
+        let stick = dir.path().join("DJ STICK");
+        std::fs::create_dir(&stick).unwrap();
+        let before = (stick.clone(), device_of(&stick));
+        std::fs::remove_dir(&stick).unwrap();
+        std::os::unix::fs::symlink("/dev", &stick).unwrap();
+        let after = (stick.clone(), device_of(&stick));
+        assert_eq!(before.0, after.0);
+        assert_ne!(before, after);
     }
 }

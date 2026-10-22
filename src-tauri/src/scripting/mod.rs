@@ -54,8 +54,10 @@ pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// An export writes every file on a playlist to a stick. AppleScript gives up
 /// on the reply after two minutes unless the script says otherwise; the
 /// export carries on either way, so this only bounds how long a request can
-/// be left waiting for a window that went away.
-pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+/// be left waiting for a window that went away. A full library to a slow
+/// stick took over 6 h on 2026-10-21, and the 6 h this was then failed the
+/// script with the export still running, so it is a day.
+pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// An error as a script is given it: an Apple Event error number and the
 /// message `on error` receives.
@@ -129,8 +131,11 @@ pub struct Bridge {
     /// The export destinations, refreshed off the main thread whenever a
     /// volume comes or goes: one listing is tens of milliseconds and up to
     /// seconds while a card reader wakes [OBS], which a script's reply must
-    /// not wait on, and Cocoa Scripting answers on the main thread.
-    devices: RwLock<Vec<rbl_devices::Device>>,
+    /// not wait on, and Cocoa Scripting answers on the main thread. Kept
+    /// with the number of the refresh that listed them; see [`Self::store_devices`].
+    devices: RwLock<(u64, Vec<rbl_devices::Device>)>,
+    /// The number the next refresh takes.
+    refreshes: AtomicU64,
 }
 
 impl Bridge {
@@ -181,14 +186,26 @@ impl Bridge {
     }
 
     pub fn devices(&self) -> Vec<rbl_devices::Device> {
-        self.devices.read().clone()
+        self.devices.read().1.clone()
     }
 
     fn refresh_devices(self: &Arc<Self>) {
         let bridge = Arc::clone(self);
+        let refresh = self.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
         tauri::async_runtime::spawn_blocking(move || {
-            *bridge.devices.write() = rbl_devices::list();
+            bridge.store_devices(refresh, rbl_devices::list());
         });
+    }
+
+    /// Keeps a refresh's listing unless a later refresh already stored one.
+    /// A listing can take seconds while a card reader wakes [OBS], so the one
+    /// taken as a stick left can finish after the one taken as it came back,
+    /// and would otherwise leave the stick out until the next change.
+    fn store_devices(&self, refresh: u64, devices: Vec<rbl_devices::Device>) {
+        let mut stored = self.devices.write();
+        if refresh > stored.0 {
+            *stored = (refresh, devices);
+        }
     }
 }
 
@@ -247,6 +264,27 @@ pub async fn script_preferences(bridge: State<'_, Arc<Bridge>>, preferences: Jso
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_slow_listing_does_not_replace_a_later_one() {
+        let bridge = Bridge::default();
+        let stick = |name: &str| rbl_devices::Device {
+            name: name.into(),
+            mount_point: std::path::PathBuf::from(format!("/Volumes/{name}")),
+            total_bytes: 0,
+            free_bytes: 0,
+            file_system: String::new(),
+            removable: true,
+            volume_id: String::new(),
+        };
+        // The stick came back (refresh 2) before the listing taken as it
+        // left (refresh 1) finished.
+        bridge.store_devices(2, vec![stick("LEXAR")]);
+        bridge.store_devices(1, Vec::new());
+        assert_eq!(bridge.devices(), vec![stick("LEXAR")]);
+        bridge.store_devices(3, Vec::new());
+        assert_eq!(bridge.devices(), [] as [rbl_devices::Device; 0]);
+    }
 
     #[test]
     fn protection_is_assumed_until_the_window_says_otherwise() {
