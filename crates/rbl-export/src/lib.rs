@@ -215,6 +215,8 @@ pub struct ExportProgress {
     pub copied: usize,
     pub converted: usize,
     /// `checking`, `copying`, `database`, `verifying`, or `publishing`.
+    /// `unit` says what `done`/`total` count: `tracks`, `bytes`,
+    /// `milliseconds`, or `files` (entries published), or empty.
     pub stage: &'static str,
     /// Tracks dealt with so far, copied, reused or skipped.
     pub done: usize,
@@ -1987,7 +1989,15 @@ fn export_cancellable_inner(
     }
     if cancelled() { return Err(ExportError::Cancelled); }
     progress(&ExportProgress { stage: "publishing", done: 0, total: 0, title: String::new(), reused: report.reused, copied: report.tracks_added + report.tracks_updated, converted: report.converted, ..Default::default() });
-    if let Err(error) = publication.commit_retained(&files) {
+    // Publishing a fresh full-library export takes most of its time, so
+    // report it in files, at most every 250 ms; the last entry always goes out.
+    let mut reported: Option<std::time::Instant> = None;
+    let mut publishing = |done: usize, total: usize| {
+        if done < total && reported.is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(250)) { return; }
+        reported = Some(std::time::Instant::now());
+        progress(&ExportProgress { stage: "publishing", done, total, unit: "files", title: String::new(), reused: report.reused, copied: report.tracks_added + report.tracks_updated, converted: report.converted, ..Default::default() });
+    };
+    if let Err(error) = publication.commit_retained_observed(&files, &mut publishing) {
         if rbl_core::durable::Publication::validation_pending(destination, PUBLICATION) {
             if let Err(rollback) = publication.rollback() {
                 return Err(ExportError::Conflict(format!("Publication failed: {error}; recovery required: {rollback}")));

@@ -45,7 +45,7 @@ export function stageLabel(job: ExportProgress, t: Translate): string {
     case "copying": return t("Copying audio");
     case "database": return t("Updating playlists and databases");
     case "verifying": return t("Verifying changed files and databases");
-    case "publishing": return t("Saving verified export");
+    case "publishing": return job.unit === "files" && job.total > 0 ? t("Publishing files {done} of {total}", { done: job.done, total: job.total }) : t("Saving verified export");
     case "finalizing": return t("Checking saved library and finishing");
     case "ejecting": return t("Safely ejecting");
     case "done": return (job.warningsCount ?? 0) > 0 ? t("Export complete with warnings") : job.upToDate ? t("Already up to date") : t("Export complete");
