@@ -1,6 +1,7 @@
 /** Analysis presets retain high-precision beat placement and key detection. */
 import { useTranslation } from "@/i18n";
 import { BPM_RANGES } from "@/lib/preferences";
+import { ANALYSIS_SLOTS } from "@/lib/queue";
 import { usePreferencesContext } from "@/store/usePreferences";
 import styles from "./Preferences.module.css";
 import { Section, Select, Toggle } from "./controls";
@@ -35,7 +36,7 @@ export function AnalysisPane(_: { tab: AnalysisTab }) {
       </div>
       <div className={styles.analysisField}>
         <Select label="Tracks analysed at once" caption="Tracks analysed at once" plain value={String(preferences.analysis.concurrentTracks)}
-          choices={[1, 2, 3, 4].map(n => ({ value: String(n), label: `${n} ${n === 1 ? "track" : "tracks"}${n === 3 ? " (default)" : ""}` }))}
+          choices={ANALYSIS_SLOTS.map(n => ({ value: String(n), label: `${n} ${n === 1 ? "track" : "tracks"}${n === 3 ? " (default)" : ""}` }))}
           onChange={value => update("analysis", { concurrentTracks: Number(value) })} />
         <p>Lower this if analysis affects playback. More tracks at once uses more processing power.</p>
       </div>

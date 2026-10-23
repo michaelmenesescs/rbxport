@@ -15,9 +15,15 @@
  * The analysis already runs its own front stages on several threads, so three
  * tracks fill a machine with eight cores and the progress still reads as a
  * count; beyond four the workers only fight.
+ *
+ * [OBS 2026-10-22, 10-core M1 mini] The throughput rig on 200 short files (decode
+ * 6 ms, analysis 3 ms each) got 807 tracks/s at 4 workers, 931 at 6 and 923
+ * at 8, so above 6 the pool adds nothing and `ANALYSIS_SLOTS` stops there;
+ * the cap also bounds how many library writers one analysis run opens, now
+ * that each track keeps one.
  */
 export const SLOTS = 3;
-export const ANALYSIS_SLOTS = [1, 2, 3, 4] as const;
+export const ANALYSIS_SLOTS = [1, 2, 3, 4, 5, 6] as const;
 
 import type { AnalysisSettings } from "@/ipc/types";
 import type { AnalysisMode } from "./preferences";
@@ -112,7 +118,7 @@ export function start(state: QueueState, slots = SLOTS, held = false): QueueStat
     return state.pending.length > 0 ? { ...state, pending: [] } : state;
   }
   if (held) return state;
-  const limit = Number.isInteger(slots) ? Math.max(1, Math.min(4, slots)) : SLOTS;
+  const limit = Number.isInteger(slots) ? Math.max(1, Math.min(ANALYSIS_SLOTS.length, slots)) : SLOTS;
   const free = limit - state.running.length;
   if (free <= 0 || state.pending.length === 0) return state;
   return {
