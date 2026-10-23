@@ -39,7 +39,58 @@ pub fn sync_dir(path: &Path) -> std::io::Result<()> {
 /// for this file system"], and so does this. The data still reaches the
 /// device; only the drive-cache barrier is lost. Every other error stays.
 pub fn flush(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    FULL_FLUSHES.with(|count| count.set(count.get() + 1));
     flush_with(file, std::fs::File::sync_all)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`flush`] ran on this thread, so a test can tell how
+    /// many drive-cache flushes a publication costs.
+    static FULL_FLUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_full_flushes() {
+    FULL_FLUSHES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn full_flushes() -> usize {
+    FULL_FLUSHES.with(std::cell::Cell::get)
+}
+
+/// Pushes a file's data and metadata to the device with a plain `fsync`,
+/// without [`flush`]'s drive-cache barrier. On a cheap FAT32 stick each
+/// `F_FULLFSYNC` costs 50 ms–1.5 s, and a library export publishes tens of
+/// thousands of files; the data is made durable by one later [`barrier`]
+/// that flushes the whole drive's cache at once.
+pub fn flush_data(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    return rustix::fs::fsync(file).map_err(std::io::Error::from);
+    // Elsewhere `sync_all` is already a plain `fsync`.
+    #[cfg(not(target_vendor = "apple"))]
+    std::fs::File::sync_all(file)
+}
+
+/// Makes everything already passed to [`flush_data`] on `on`'s device
+/// durable: [`flush`] on `on` (a file or a directory), whose `F_FULLFSYNC`
+/// flushes the whole drive's cache on Apple platforms, not only `on`.
+///
+/// A filesystem that rejects the flush as unsupported is treated as
+/// [`sync_dir`] treats it (exFAT on macOS rejects `fsync` on a directory
+/// with ENOTSUP): the barrier is skipped, and every other error fails.
+pub fn barrier(on: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Err(error) = flush(&std::fs::File::open(on)?) {
+        if !unsupported(&error) {
+            return Err(error);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = on;
+    Ok(())
 }
 
 /// [`flush`] with the full flush supplied, so a test can stand in for a
@@ -522,7 +573,7 @@ impl Publication {
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open(&image)
-                    .and_then(|file| flush(&file))
+                    .and_then(|file| flush_data(&file))
                     .map_err(at("flush", &image))?;
             }
             let target = self.root.join(path);
@@ -541,10 +592,20 @@ impl Publication {
                 parent = dir.parent();
             }
         }
-        // Flush each directory once, children before parents.
+        // Push each directory once, children before parents, as the images
+        // were: to the device, without a drive-cache flush of its own.
+        #[cfg(unix)]
         for directory in directories.iter().rev() {
-            sync_dir(directory)?;
+            if let Err(error) = std::fs::File::open(directory).and_then(|handle| flush_data(&handle)) {
+                // exFAT on macOS rejects `fsync` on a directory; see `sync_dir`.
+                if !unsupported(&error) {
+                    return Err(at("flush", directory)(error));
+                }
+            }
         }
+        // One drive-cache flush makes every image and directory above
+        // durable before the journal records them as ready to publish.
+        barrier(self.stage.path())?;
         write(
             &self.stage.path().join("publication.json"),
             &serde_json::to_vec(&entries)?,
@@ -1898,5 +1959,34 @@ mod tests {
                 assert!(!journal.exists());
             }
         }
+    }
+
+    #[test]
+    fn a_barrier_the_filesystem_lacks_falls_back_to_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        // barrier on a directory and on a file both succeed on the test volume
+        barrier(dir.path()).unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        barrier(&file).unwrap();
+    }
+
+    #[test]
+    fn commit_makes_one_full_flush_per_publication_not_per_file() {
+        let root = tempfile::tempdir().unwrap();
+        let publication = Publication::new(root.path(), ".rbxport-publication").unwrap();
+        let paths: Vec<PathBuf> = (0..50).map(|i| PathBuf::from(format!("Contents/a/{i}.mp3"))).collect();
+        for p in &paths {
+            let staged = publication.stage().join(p);
+            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            std::fs::write(&staged, b"audio").unwrap();
+        }
+        reset_full_flushes();
+        publication.commit(&paths).unwrap();
+        // 57 measured (109 before the barrier): `finish` still flushes the
+        // directory after every rename. Task 3 defers those and tightens
+        // this to 12.
+        assert!(full_flushes() <= 57, "got {}", full_flushes());
+        for p in &paths { assert!(root.path().join(p).is_file()); }
     }
 }
