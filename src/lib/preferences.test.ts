@@ -37,6 +37,11 @@ describe("sanitisePreferences", () => {
     expect(sanitisePreferences({ advanced: { protectLibrary: true } }).advanced.protectLibrary).toBe(true);
   });
 
+  it("accepts up to six tracks analysed at once and falls back from more", () => {
+    expect(sanitisePreferences({ analysis: { concurrentTracks: 6 } }).analysis.concurrentTracks).toBe(6);
+    expect(sanitisePreferences({ analysis: { concurrentTracks: 7 } }).analysis.concurrentTracks).toBe(3);
+    expect(sanitisePreferences({ analysis: { concurrentTracks: 0 } }).analysis.concurrentTracks).toBe(3);
+  });
   it("preserves the BPM-change visibility preference and enables it for older settings", () => {
     expect(sanitisePreferences({view: {showBpmChanges: false}}).view.showBpmChanges).toBe(false);
     expect(sanitisePreferences({view: {}}).view.showBpmChanges).toBe(true);
