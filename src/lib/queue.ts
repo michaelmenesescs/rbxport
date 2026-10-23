@@ -16,7 +16,7 @@
  * tracks fill a machine with eight cores and the progress still reads as a
  * count; beyond four the workers only fight.
  *
- * [OBS 2026-10-22, 10-core M1 mini] The throughput rig on 200 short files (decode
+ * [OBS 2026-10-22, 10-core M4 mini] The throughput rig on 200 short files (decode
  * 6 ms, analysis 3 ms each) got 807 tracks/s at 4 workers, 931 at 6 and 923
  * at 8, so above 6 the pool adds nothing and `ANALYSIS_SLOTS` stops there;
  * the cap also bounds how many library writers one analysis run opens, now

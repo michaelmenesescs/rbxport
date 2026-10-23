@@ -59,3 +59,52 @@ A crash before the final barrier can lose some renames of *new* files; replay (`
 
 - One user, macOS (MacBook Pro M1 Max), sticks FAT32 MBR, player XDJ-700 (reads `export.pdb`).
 - Benchmarks run on the Mac mini (`ssh mini`, M4, repo at `~/Coding/rbxport`), never against the user's real library, Overflow, or gig stick.
+
+## Baseline (mini, FAT32 image)
+
+`scripts/bench-fat32.sh ~/rbx-bench/paths_6741.txt 12` at `f64ffbe2`, 10-core M4 mini. A 12 GB FAT32 MBR disk image attached with `hdiutil`, so the filesystem and its flush behaviour are the stick's, but the USB link's slowness is not. 6,741 tracks → 25,948 published files, 1,286 MB.
+
+| stage | fresh export |
+|---|---|
+| checking | 0.22 s |
+| copying | 134.67 s |
+| database | 1.22 s |
+| publishing | 361.71 s |
+| verifying | 10.47 s |
+| **total** | **509.87 s** |
+| re-export, nothing changed | 3.47 s |
+| re-export, one title changed | 14.98 s (publishing 0.92 s) |
+| re-export, all ratings changed | 14.79 s (publishing 0.87 s) |
+
+`stick_check`: 6,741 tracks, 6,741 playlist entries, `track files missing: 0`.
+
+## Results (same rig, same machine, after Tasks 2–4)
+
+| stage | before | after | |
+|---|---|---|---|
+| checking | 0.22 s | 0.09 s | |
+| copying | 134.67 s | 95.84 s | page cache, not a code change |
+| database | 1.22 s | 1.17 s | |
+| publishing | 361.71 s | **159.79 s** | 2.26× faster |
+| verifying | 10.47 s | 8.79 s | |
+| **total** | **509.87 s** | **267.23 s** | 1.91× faster |
+
+`stick_check` after the run: 6,741 tracks, `track files missing: 0`.
+
+Full drive-cache flushes for publishing 50 new files (unit test `commit_makes_one_full_flush_per_publication_not_per_file`): **109 before, 57 after the single commit barrier, 9 after the deferred directory flushes**. On a stick each of those used to cost 50 ms–1.5 s, which is why the FAT32 image understates the win:
+
+- A microbenchmark on the same image (`fsync` each vs `rename` each, 3,000 files) measured **0.15 ms per `fsync`** and **10.0 ms per `rename`**. Publishing 25,948 entries is therefore rename-bound on the image (≈160 s of `rename`), and the flushes this plan removed were nearly free there. The same run on a real stick removes ~25,000 × 50 ms–1.5 s of `F_FULLFSYNC`, which is the 6-hour export.
+- G1's "≤ 10 % of baseline on the FAT32 image" is therefore **not met on the image** (44 %), and cannot be: what remains is the image's per-rename cost, not flushing. The real-stick half of G1 ("full-library publish < 10 min") needs the spare stick in Task 8; not yet measured.
+
+Analysis and concurrency:
+
+- One library writer per analysed track (`writer_opens` counter, `analysing_a_track_opens_the_library_once`): **1 `Writer::open` per track, down from ~4** (G3).
+- "Tracks analysed at once" now offers 1–6 (G4 asked 1–8). The throughput rig on 200 files got 807 tracks/s at 4 workers, 931 at 6 and 923 at 8: **8 is not faster than 6**, so `ANALYSIS_SLOTS` stops at 6 as the plan allows. The rig's files are short (decode 6 ms, analysis 3 ms); the knee on five-minute files is lower still.
+- App-level tracks/min for the 200-track copy was not measured: it needs the release app driving a copied library, and the concurrency question it would answer is already answered by the rig above.
+
+## Deviations
+
+- G1's FAT32 half is unachievable on a disk image (rename-bound; see above). The real-stick numbers are pending a spare stick.
+- G4 caps at 6, not 8, per the plan's own escape clause.
+- "Publishing files {done} of {total}" is not yet in the generated locale files (`pnpm locales` needs network); non-English users see it in English until that runs.
+- `pnpm test` on plain Node 26 fails 27 unrelated tests because Node's built-in `localStorage` replaces the test environment's; `NODE_OPTIONS=--no-experimental-webstorage pnpm test` passes 1,476/1,476. Pre-existing, not caused by this branch.
