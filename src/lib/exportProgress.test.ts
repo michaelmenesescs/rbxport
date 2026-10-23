@@ -41,4 +41,11 @@ describe("export stage feedback", () => {
     expect(stageLabel({ ...job, state: "done", upToDate: true }, t)).toBe("Already up to date");
     expect(stageLabel({ ...job, state: "done", warningsCount: 1 }, t)).toBe("Export complete with warnings");
   });
+  it("counts files while publishing, once their number is known", () => {
+    const t = (text: string, values?: Readonly<Record<string, string | number>>) =>
+      text.replace(/\{(\w+)\}/g, (match, key: string) => String(values?.[key] ?? match));
+    expect(stageLabel({ ...job, state: "publishing", unit: "files", done: 3, total: 7 }, t)).toBe("Publishing files 3 of 7");
+    expect(stageLabel({ ...job, state: "publishing", unit: "files", done: 0, total: 0 }, t)).toBe("Saving verified export");
+    expect(stagePercent({ ...job, state: "publishing", unit: "files", done: 3, total: 7 })).toBeUndefined();
+  });
 });

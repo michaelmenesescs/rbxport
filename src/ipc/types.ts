@@ -1661,7 +1661,7 @@ export interface ExportProgress {
   bytesPerSecond?: number;
   jobId?: string;
   sequence?: number;
-  unit?: "tracks" | "bytes" | "milliseconds" | "";
+  unit?: "tracks" | "bytes" | "milliseconds" | "files" | "";
   bytesDone?: number;
   bytesTotal?: number;
   /** With a bytes or milliseconds event: tracks before this one, and in the stage. */

@@ -921,3 +921,18 @@ fn a_track_that_cannot_be_converted_is_reported_and_the_rest_still_sync() {
     let wavs = std::fs::read_dir(dest.path().join("Contents")).unwrap().count();
     assert!(wavs > 0);
 }
+
+#[test]
+fn an_export_reports_publishing_progress_in_files() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = common::stick();
+    let tracks: Vec<SourceTrack> = (1..=5).map(|n| track(src.path(), n, &format!("Track {n}"), "Artist")).collect();
+    let mut events: Vec<rbl_export::ExportProgress> = Vec::new();
+    rbl_export::export_with_options(dest.path(), &tracks, &[], &[], &rbl_export::ExportOptions::default(), &mut |p| events.push(p.clone())).unwrap();
+
+    let publishing: Vec<_> = events.iter().filter(|p| p.stage == "publishing" && p.unit == "files").collect();
+    assert!(publishing.iter().any(|p| p.total > 0), "publishing reports progress in files: {events:?}");
+    let last = publishing.last().unwrap();
+    assert!(last.total > 0, "{last:?}");
+    assert_eq!(last.done, last.total, "the last publishing event reports every file published: {last:?}");
+}
