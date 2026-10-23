@@ -423,8 +423,14 @@ impl Publication {
     }
     /// Publish while retaining both generations until independent validation.
     pub fn commit_retained(&self, paths: &[PathBuf]) -> std::io::Result<()> {
+        self.commit_retained_observed(paths, &mut |_, _| {})
+    }
+
+    /// [`Publication::commit_retained`], telling `observe` how far
+    /// publishing has got; see [`Publication::commit_observed`].
+    pub fn commit_retained_observed(&self, paths: &[PathBuf], observe: &mut dyn FnMut(usize, usize)) -> std::io::Result<()> {
         write(&self.stage.path().join(".verification-required"), b"1")?;
-        self.commit(paths)
+        self.commit_observed(paths, observe)
     }
 
     /// Mark independently verified files committed before reclaiming old images.
@@ -448,7 +454,7 @@ impl Publication {
             std::fs::remove_file(&marker)?;
             sync_dir(journal)?;
         }
-        Self::finish(root, journal, false)
+        Self::finish(root, journal, false, &mut |_, _| {})
     }
 
     /// Restore the complete previous generation, with replayable rollback intent.
@@ -522,7 +528,7 @@ impl Publication {
         let lock = lock(root)?;
         let journal = root.join(name);
         if journal.try_exists()? {
-            Self::finish(root, &journal, true)?;
+            Self::finish(root, &journal, true, &mut |_, _| {})?;
         }
         // Under the exclusive lock nothing else is using a stage, so any
         // left here belonged to an export that stopped or could not delete
@@ -554,6 +560,14 @@ impl Publication {
     /// Missing staged files mean deletion. Paths are relative to root, and
     /// are the names the files are published under.
     pub fn commit(&self, paths: &[std::path::PathBuf]) -> std::io::Result<()> {
+        self.commit_observed(paths, &mut |_, _| {})
+    }
+
+    /// [`Publication::commit`], calling `observe(done, total)` after each
+    /// of the `total` journal entries is published, so an export of tens of
+    /// thousands of files can show how far publishing has got. How often to
+    /// report on is the caller's to decide.
+    pub fn commit_observed(&self, paths: &[std::path::PathBuf], observe: &mut dyn FnMut(usize, usize)) -> std::io::Result<()> {
         self.check_root()?;
         validate_paths(paths)?;
         let moves = Self::moves(self.stage.path())?;
@@ -615,7 +629,7 @@ impl Publication {
         // This run wrote the journal and holds the lock: nothing else can
         // have changed the device since, and a file that looks newer only
         // has a clock ahead of this one (FAT keeps local time with no zone).
-        Self::finish(&self.root, &self.journal, false)
+        Self::finish(&self.root, &self.journal, false, observe)
     }
 
     pub fn recover(root: &Path, name: &str) -> std::io::Result<()> {
@@ -623,7 +637,7 @@ impl Publication {
         if journal.try_exists()? {
             let _lock = lock(root)?;
             if journal.try_exists()? {
-                Self::finish(root, &journal, true)?;
+                Self::finish(root, &journal, true, &mut |_, _| {})?;
             }
         }
         Ok(())
@@ -721,7 +735,7 @@ impl Publication {
                 .map(|(entry, _)| PublicationEntry { path: entry.path.clone(), present: entry.present, had_target: entry.had_target, exact: true })
                 .collect();
             write(&record, &serde_json::to_vec(&rest)?)?;
-            Self::finish(root, &journal, false)?;
+            Self::finish(root, &journal, false, &mut |_, _| {})?;
         } else {
             for (entry, theirs) in entries.iter().zip(&theirs).rev() {
                 if *theirs {
@@ -754,7 +768,20 @@ impl Publication {
     #[allow(clippy::too_many_lines, reason = "one ordered roll-forward over the journal")]
     /// `replay`: the journal was left by a run that stopped, so the device
     /// may have been written to since; see [`check_external_changes`].
-    fn finish(root: &Path, journal: &Path, replay: bool) -> std::io::Result<()> {
+    /// `observe(done, total)` is called after each entry is published.
+    ///
+    /// A cheap FAT32 stick spends 50 ms–1.5 s on each `F_FULLFSYNC`, and a
+    /// fresh export publishes tens of thousands of new files, so flushing
+    /// the directory after each of their renames cost one drive flush per
+    /// file. A rename into a directory is made durable by flushing that
+    /// directory, whenever that happens, and until the journal is retired a
+    /// lost rename is replayed from the image still in it. So a new file's
+    /// rename is not flushed on its own: each directory it touched is
+    /// flushed once after the loop, then one drive barrier, before the
+    /// journal can be retired. Relocations, replacements and deletions keep
+    /// their flush per entry, as their order matters if the device is
+    /// unplugged part way.
+    fn finish(root: &Path, journal: &Path, replay: bool, observe: &mut dyn FnMut(usize, usize)) -> std::io::Result<()> {
         if journal.join(".rollback").try_exists()? { return Self::rollback_at(root, journal); }
         let record = journal.join("publication.json");
         let entries: Vec<PublicationEntry> = serde_json::from_slice(
@@ -787,7 +814,7 @@ impl Publication {
         // audio file is published with atomic renames instead of being copied
         // over the USB a second time. Every intermediate state is recognizable
         // and recovery always rolls forward.
-        let publish = |entry: &PublicationEntry| -> std::io::Result<()> {
+        let publish = |entry: &PublicationEntry, touched: &mut std::collections::BTreeSet<PathBuf>| -> std::io::Result<()> {
             if root_handle != same_file::Handle::from_path(root)? {
                 return Err(std::io::Error::other("Destination volume changed during publication"));
             }
@@ -829,6 +856,11 @@ impl Publication {
                             "Publication target vanished at {}; recovery data was retained",
                             entry.path.display()
                         )));
+                    }
+                    if !target.try_exists()? && !previous.try_exists()? {
+                        // A new file: no flush of its own; see above.
+                        publish_new(root, &image, &target, touched)?;
+                        return Ok(());
                     }
                     if target.try_exists()? {
                         if target.is_dir() {
@@ -900,8 +932,9 @@ impl Publication {
             }
             Ok(())
         };
-        for entry in &entries {
-            publish(entry).map_err(|error| {
+        let mut touched = std::collections::BTreeSet::new();
+        for (index, entry) in entries.iter().enumerate() {
+            publish(entry, &mut touched).map_err(|error| {
                 // Every failure names the file it was publishing.
                 if error.to_string().contains(&*entry.path.to_string_lossy()) {
                     error
@@ -909,6 +942,14 @@ impl Publication {
                     std::io::Error::new(error.kind(), format!("Could not publish {}: {error}", entry.path.display()))
                 }
             })?;
+            observe(index + 1, entries.len());
+        }
+        // Deepest first, so a folder is durable before the entry naming it.
+        for directory in touched.iter().rev() {
+            sync_dir(directory)?;
+        }
+        if !touched.is_empty() {
+            barrier(root)?;
         }
         if journal.join(".verification-required").try_exists()? { return Ok(()); }
         Self::retire(root, journal)
@@ -939,6 +980,27 @@ impl Drop for Publication {
         // `TempDir`'s own cleanup is not enough on a stick.
         let _ = remove_tree(self.stage.path());
     }
+}
+
+/// Renames a new file's image to `target`, where nothing was, with no
+/// directory flush: `target`'s folder, every folder this had to create and
+/// each of their parents inside `root` are added to `touched` for
+/// [`Publication::finish`] to flush once all entries are published.
+fn publish_new(root: &Path, image: &Path, target: &Path, touched: &mut std::collections::BTreeSet<PathBuf>) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        let mut missing = parent;
+        while missing.starts_with(root) && !missing.try_exists()? {
+            touched.insert(missing.to_path_buf());
+            if let Some(above) = missing.parent().filter(|above| above.starts_with(root)) {
+                touched.insert(above.to_path_buf());
+            }
+            let Some(above) = missing.parent() else { break };
+            missing = above;
+        }
+        std::fs::create_dir_all(parent).map_err(at("create the folder", parent))?;
+        touched.insert(parent.to_path_buf());
+    }
+    rename(image, target).map_err(at("publish", target))
 }
 
 /// The name a journal entry is published under. A journal written before
@@ -1983,10 +2045,67 @@ mod tests {
         }
         reset_full_flushes();
         publication.commit(&paths).unwrap();
-        // 57 measured (109 before the barrier): `finish` still flushes the
-        // directory after every rename. Task 3 defers those and tightens
-        // this to 12.
-        assert!(full_flushes() <= 57, "got {}", full_flushes());
+        // 9 measured (57 with a directory flush per new file, 109 before
+        // the barrier): commit's barrier, the record and its folder, the
+        // journal's rename, each touched folder (3) once, finish's barrier,
+        // and retiring the journal.
+        assert!(full_flushes() <= 12, "got {}", full_flushes());
         for p in &paths { assert!(root.path().join(p).is_file()); }
+    }
+
+    /// A fresh export's new files are renamed into place with no directory
+    /// flush of their own, so an unplug can lose any of those renames, and
+    /// the folders they created, until the deferred flushes at the end.
+    /// The journal still holds the images then, and replay must publish
+    /// the complete new generation.
+    #[test]
+    fn deferred_new_file_renames_replay_after_a_lost_directory_flush() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join(".rbxport-publication");
+        let publication = Publication::new(root.path(), ".rbxport-publication").unwrap();
+        let paths: Vec<PathBuf> = (0..50)
+            .map(|i| PathBuf::from(if i < 25 { format!("Contents/a/{i}.mp3") } else { format!("Contents/b/c/{i}.mp3") }))
+            .collect();
+        for p in &paths {
+            write_file(&publication.stage().join(p), format!("audio {}", p.display()).as_bytes());
+        }
+        // Retained, so the journal and its record outlive the publication.
+        publication.commit_retained(&paths).unwrap();
+        drop(publication);
+        assert!(journal.join("publication.json").is_file());
+        // The renames that never reached the device: three files in a folder
+        // that existed, and a whole folder tree the publication created.
+        let lost: Vec<&PathBuf> = paths.iter().filter(|p| p.starts_with("Contents/b") || ["Contents/a/3.mp3", "Contents/a/11.mp3", "Contents/a/24.mp3"].contains(&p.to_str().unwrap())).collect();
+        for p in &lost {
+            let image = journal.join(p);
+            std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+            std::fs::rename(root.path().join(p), &image).unwrap();
+        }
+        std::fs::remove_dir_all(root.path().join("Contents/b")).unwrap();
+        let record = std::fs::read(journal.join("publication.json")).unwrap();
+        write(&journal.join("publication.json"), &record).unwrap();
+
+        Publication::recover(root.path(), ".rbxport-publication").unwrap();
+        Publication::finalize_pending(root.path(), ".rbxport-publication").unwrap();
+
+        for p in &paths {
+            assert_eq!(std::fs::read(root.path().join(p)).unwrap(), format!("audio {}", p.display()).as_bytes());
+        }
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn publishing_reports_progress_for_every_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let publication = Publication::new(root.path(), ".rbxport-publication").unwrap();
+        let paths: Vec<PathBuf> = (0..20).map(|i| PathBuf::from(format!("Contents/a/{i}.mp3"))).collect();
+        for p in &paths {
+            write_file(&publication.stage().join(p), b"audio");
+        }
+        let mut seen = Vec::new();
+        publication.commit_observed(&paths, &mut |done, total| seen.push((done, total))).unwrap();
+        assert_eq!(seen.last(), Some(&(20, 20)));
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "{seen:?}");
+        assert!(seen.iter().all(|(_, total)| *total == 20), "{seen:?}");
     }
 }
