@@ -237,6 +237,15 @@ fn a_writer_session_ends_with_its_track() {
 - [ ] **Step 5:** `cargo test -p rbl-devices`, `cargo test -p rbxport --lib`, clippy.
 - [ ] **Step 6:** Commit `fix(scripting): export to a stick needing recovery, 24 h export timeout`.
 
+### Tasks 9–10 (done 2026-11-07): the copy and publish stages
+
+Two changes found by attributing the remaining 267 s to primitives on the FAT32 image (11.7 ms a 150 KB file copied through a temp file that is renamed over it; 6.2 ms a rename, 25,948 renames in publishing).
+
+- **Task 9, copy in place.** `copy_data_observed` wrote every staged file through a `NamedTempFile` and renamed it on top. The stage is scratch and the journal that names its images is written only after the copies finish, so a half-written image there cannot be published; write straight to the staged path instead. `PreparationCache::original` drops its own temp for the same reason (its receipt only names a file it wrote completely). Copying 95.84 s → 41.69 s.
+- **Task 10, publish a new analysis directory as one entry.** Three quarters of publishing's renames were the three ANLZ files of each track, which share a directory the stick does not have yet. `collapse_new_analysis_directories` replaces such a group with the directory in the commit list, and `Publication` entries may now be directories: `commit` does not open one for writing, `check_external_changes` skips one, and set-aside removes its tree. Replacements keep their per-file order and flushes. Publishing 159.79 s → 85.23 s, entry count 25,948 → 12,466. Pinned by `a_new_directory_image_is_published_as_one_directory`, `a_lost_directory_rename_replays_from_the_journal` and `a_new_analysis_directory_is_published_as_one_entry`.
+
+Deliberately not done: parallel copying. It is 2.4× on the image but nothing on a real export, which is bound by the source's USB 2.0 link.
+
 ### Task 8: End-to-end check on a real stick, then release build
 
 **Files:** none new. Updates the PRD results table.

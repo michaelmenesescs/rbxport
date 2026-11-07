@@ -102,6 +102,27 @@ Analysis and concurrency:
 - "Tracks analysed at once" now offers 1–6 (G4 asked 1–8). The throughput rig on 200 files got 807 tracks/s at 4 workers, 931 at 6 and 923 at 8: **8 is not faster than 6**, so `ANALYSIS_SLOTS` stops at 6 as the plan allows. The rig's files are short (decode 6 ms, analysis 3 ms); the knee on five-minute files is lower still.
 - App-level tracks/min for the 200-track copy was not measured: it needs the release app driving a copied library, and the concurrency question it would answer is already answered by the rig above.
 
+## Results after the copy and publish changes (2026-11-07)
+
+Same rig, same machine, `~/rbx-bench/paths_6741.txt` 12, `c81dd34b`.
+
+| stage | after Tasks 2–4 | after copy + publish | | |
+|---|---|---|---|---|
+| checking | 0.09 s | 0.09 s | | |
+| copying | 95.84 s | **41.69 s** | 2.30× | staged copies are written in place, not through a temp file that is renamed over them |
+| database | 1.17 s | 1.15 s | | |
+| publishing | 159.79 s | **85.23 s** | 1.87× | a new track's analysis directory is published as one entry, not its three ANLZ files |
+| verifying | 8.79 s | 8.48 s | | |
+| **total** | **267.23 s** | **138.18 s** | 1.93× | 3.69× against the original 509.87 s baseline |
+
+`stick_check` after the run: 6,741 tracks, 6,741 playlist entries, `track files missing: 0`.
+
+Publishing's entry count drops from 25,948 to 12,466 (6,741 audio, 6,741 analysis directories, the databases and artwork). What remains is the audio renames and one rename per analysis directory, which is the floor for this design: the stage image has to be renamed into place for the journal to mean anything.
+
+Copying is latency-bound on the image, not bandwidth-bound (2,201 files/s at ~191 KB each). Measured on the same image, four concurrent copies run 2.4× a single one, so parallel copy would take this stage to ~17 s *on the image*. It would not help a real export: the copy from Overflow runs at ~30 MB/s over a USB 2.0 link, which no amount of concurrency improves. Left undone deliberately.
+
+Both runs agree on publishing (85.06 s and 85.23 s), so that number is the change, not noise. The re-export `checking` stage moved from 0.09 s to ~20.7 s between the earlier run and these two; it is cold page cache on the mini, not a code change, and the fresh-export columns are unaffected.
+
 ## Deviations
 
 - G1's FAT32 half is unachievable on a disk image (rename-bound; see above). The real-stick numbers are pending a spare stick.
