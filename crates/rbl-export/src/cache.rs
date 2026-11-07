@@ -107,12 +107,14 @@ impl PreparationCache {
         std::fs::create_dir_all(&self.root)?;
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         let _permit = self.permit(cancelled)?;
-        let temp = tempfile::NamedTempFile::new_in(&self.root)?;
-        let (size, hash) = crate::copy_staged_observed(source, temp.path(), &mut |done, total| { progress(done, total); !cancelled() })?;
+        // Written straight to `path`: this cache is disposable, and a receipt
+        // only ever names a file it wrote completely, so a half-written one is
+        // ignored and rewritten. Saves a create and a rename per prepared file
+        // on FAT32 (see `copy_data_observed`).
+        let (size, hash) = crate::copy_staged_observed(source, &path, &mut |done, total| { progress(done, total); !cancelled() })?;
         if incremental::revision_fresh(source)?.as_ref() != Some(&source_revision) {
             return Err(ExportError::Conflict("Source changed while it was being prepared".into()));
         }
-        temp.persist(&path).map_err(|e| e.error)?;
         let output = incremental::revision_fresh(&path)?.ok_or_else(|| std::io::Error::other("Prepared source disappeared"))?;
         let receipt = Receipt { source: source_revision, output, size, digest: format!("fnv1a:{hash:016x}") };
         rbl_core::durable::write(&receipt_path, &serde_json::to_vec(&receipt).map_err(std::io::Error::other)?)?;

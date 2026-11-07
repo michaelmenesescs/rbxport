@@ -2514,8 +2514,13 @@ fn copy_data_observed(from: &Path, to: &Path, durable: bool, progress: &mut dyn 
     }
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let parent = to.parent().unwrap_or(Path::new("."));
-    let staging = tempfile::NamedTempFile::new_in(parent)?;
-    let mut target = staging.reopen()?;
+    // Written in place, not to a temporary beside it that is renamed on top:
+    // the stage is scratch, and the journal does not name a file until
+    // `commit`, so a half-written image there can never be published. On a
+    // FAT32 stick the extra create and rename were most of a copy's cost
+    // [OBS 2026-11-07, FAT32 image: 11.7 ms a 150 KB file via a temp name,
+    // 3.8 ms written in place].
+    let mut target = std::fs::File::create(to)?;
     let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(COPY_QUEUE);
     let (ack, acknowledgements) = std::sync::mpsc::channel();
     let mut acknowledged = 0;
@@ -2553,7 +2558,6 @@ fn copy_data_observed(from: &Path, to: &Path, durable: bool, progress: &mut dyn 
         .map_err(|_| std::io::Error::other("the copy's writer thread panicked"))??;
     read_result?;
     if !progress(written, total) { return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Export stopped")); }
-    staging.persist(to).map_err(|e| e.error)?;
     if durable { rbl_core::durable::sync_dir(parent)?; }
     Ok((written, hash))
 }
