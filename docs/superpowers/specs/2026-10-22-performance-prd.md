@@ -104,24 +104,54 @@ Analysis and concurrency:
 
 ## Results after the copy and publish changes (2026-11-07)
 
-Same rig, same machine, `~/rbx-bench/paths_6741.txt` 12, `c81dd34b`.
+**The rig is not stable between sessions.** The same code, before either of these changes (`fed5f722`), measured a 267.23 s fresh export on 2026-10-22 and a 142.41 s one on 2026-11-07 on the same machine, image size and corpus; publishing alone was 159.79 s against 82.27 s. Page cache, image allocation and machine load move these numbers by up to ~80 %, so the earlier table cannot serve as a baseline and no "×-fold against the old table" claim is made here. What follows is two back-to-back runs in one session, each from a clean rebuild, with the change reverted in the working tree for the "before" run.
 
-| stage | after Tasks 2–4 | after copy + publish | | |
-|---|---|---|---|---|
-| checking | 0.09 s | 0.09 s | | |
-| copying | 95.84 s | **41.69 s** | 2.30× | staged copies are written in place, not through a temp file that is renamed over them |
-| database | 1.17 s | 1.15 s | | |
-| publishing | 159.79 s | **85.23 s** | 1.87× | a new track's analysis directory is published as one entry, not its three ANLZ files |
-| verifying | 8.79 s | 8.48 s | | |
-| **total** | **267.23 s** | **138.18 s** | 1.93× | 3.69× against the original 509.87 s baseline |
+| rig | stage | before (`fed5f722`) | after (`c81dd34b`) |
+|---|---|---|---|
+| mini, 6,741 files, FAT32 image | copying | 47.51 s | 41.69 s |
+| | publishing | 82.27 s | 85.23 s |
+| | verifying | 9.44 s | 8.48 s |
+| | **total** | **142.41 s** | **138.18 s** |
+| laptop, 2,000 files, FAT32 image | copying | 44.84 s | 26.72 s |
+| | publishing | 46.81 s | 53.05 s |
+| | **total** | **94.84 s** | **82.57 s** |
 
-`stick_check` after the run: 6,741 tracks, 6,741 playlist entries, `track files missing: 0`.
+`stick_check` after the mini run: 6,741 tracks, 6,741 playlist entries, `track files missing: 0`.
 
-Publishing's entry count drops from 25,948 to 12,466 (6,741 audio, 6,741 analysis directories, the databases and artwork). What remains is the audio renames and one rename per analysis directory, which is the floor for this design: the stage image has to be renamed into place for the journal to mean anything.
+What that supports, and what it does not:
 
-Copying is latency-bound on the image, not bandwidth-bound (2,201 files/s at ~191 KB each). Measured on the same image, four concurrent copies run 2.4× a single one, so parallel copy would take this stage to ~17 s *on the image*. It would not help a real export: the copy from Overflow runs at ~30 MB/s over a USB 2.0 link, which no amount of concurrency improves. Left undone deliberately.
+- **Writing staged copies in place is worth 1.12× on the mini rig and 1.68× on the laptop rig, to copying only.** The two figures differ because the stage's per-file cost is a smaller share of a bigger, cache-warmed copy on the mini. Direction is consistent; magnitude is rig-dependent.
+- **Publishing did not move.** 82.27 s against 85.23 s, and 46.81 s against 53.05 s, are the same within this rig's noise.
+- **The analysis-directory collapse is not exercised by this rig at all.** `export_cost` builds `SourceTrack`s with no analysis, so the export writes no `ANLZ0000.*` files: the 2,000-file run publishes 2,005 files and 4,006 folders. The collapse has unit and durability tests (`a_new_analysis_directory_is_published_as_one_entry`, `a_new_directory_image_is_published_as_one_directory`, `a_lost_directory_rename_replays_from_the_journal`) but no rig measurement. Measuring it needs an export whose tracks carry analysis — the app on a copied library, or a harness that supplies analysis bytes — with the publish entry count reported. Until then, treat its value as unproven: a real export of the owner's analysed library writes three ANLZ files per track, so it should cut roughly 13,500 of ~26,000 publish renames to ~6,700, which is the 2.6×-on-that-portion measured earlier with a rename microbenchmark (8.81 ms a file, 10.21 ms a directory).
+- **A consequence of the variance:** the 509.87 s → 267.23 s figures earlier in this document came from different sessions and should be read as indicative, not as a controlled comparison.
 
-Both runs agree on publishing (85.06 s and 85.23 s), so that number is the change, not noise. The re-export `checking` stage moved from 0.09 s to ~20.7 s between the earlier run and these two; it is cold page cache on the mini, not a code change, and the fresh-export columns are unaffected.
+Copying is latency-bound on an image, not bandwidth-bound. Four concurrent copies of the same files ran 2.4× a single one on the image, so parallel copy would help there — but on the real media measured below, the card's write throughput is the limit, and concurrency does not create bandwidth. Left undone deliberately; it is worth revisiting only if a benchmark with a fast stick shows copy still dominant.
+
+## Real media: the CITISCI SD card (2026-11-07)
+
+A disk image reproduces a filesystem, not a device. The owner's Citizen Science SD card (256 GB, HFS+ Journaled, `/Volumes/CITISCI`, ~87 GB used) took a scratch run: 2,000 stand-in audio files of 190 KB, exported into `.rbxport-bench` on the card and deleted afterwards. The card's own library (`.PIONEER`, `Contents`, `PIONEER REC`) was not touched.
+
+| stage | CITISCI SD (HFS+) | FAT32 image, same 2,000 files |
+|---|---|---|
+| copying | 245.07 s | 26.72 s |
+| publishing | 15.79 s | 53.05 s |
+| verifying | 4.18 s | 1.90 s |
+| database | 2.43 s | 0.38 s |
+| **total** | **268.09 s** | **82.57 s** |
+
+`stick_check` on the exported folder: 2,000 tracks, 2,000 playlist entries, `track files missing: 0`. (The card is HFS+, so the export used its hidden `.PIONEER` root; checked through a temporary symlink, since `stick_check` looks for `PIONEER/rekordbox/export.pdb`.)
+
+The primitives, measured on the card itself:
+
+| operation | CITISCI SD |
+|---|---|
+| sequential write, 200 MB | 1.54 MB/s (136 s) |
+| create + write 300 files of 190 KB | 32.5 ms a file, 5.8 MB/s |
+| rename | 0.1 ms each |
+
+So on this card the media's write throughput is the whole export: copying is 91 % of it, and publishing — renames plus the barriers — is 16 s for 2,000 tracks. No publishing work would buy anything here; a faster card or reader is what moves it. This is the same shape as the original Kingston export (5 h at ~3 MB/s): the stick was the bottleneck, not rbxport.
+
+Note for the entry-count question below: the `export_cost` rig never writes ANLZ files, because its `SourceTrack`s carry no analysis, so this run has 2,005 published files and 4,006 folders and exercises none of the analysis-directory collapse.
 
 ## Deviations
 
