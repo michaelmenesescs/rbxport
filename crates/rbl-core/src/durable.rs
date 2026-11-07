@@ -583,7 +583,10 @@ impl Publication {
             let image = self.stage.path().join(path);
             let image_present = image.try_exists()?;
             let present = image_present || moves.contains_key(path);
-            if image_present {
+            // A whole new analysis folder is published as one image. A
+            // directory cannot be opened for writing, and its contents are
+            // flushed by the `directories` pass below.
+            if image_present && std::fs::metadata(&image)?.is_file() {
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open(&image)
@@ -750,8 +753,13 @@ impl Publication {
                     rename(&previous, &target).map_err(at("put back", &target))?;
                     sync_dir(target.parent().unwrap_or(root))?;
                 } else if entry.present && entry.had_target == Some(false) && published(entry) && target.try_exists()? {
-                    // Published where the device had nothing.
-                    in_stored_form(&target, |p| std::fs::remove_file(p)).map_err(at("remove", &target))?;
+                    // Published where the device had nothing. A whole new
+                    // folder is published as one image, so remove its tree.
+                    if target.is_dir() {
+                        remove_tree(&target).map_err(at("remove", &target))?;
+                    } else {
+                        in_stored_form(&target, |p| std::fs::remove_file(p)).map_err(at("remove", &target))?;
+                    }
                 }
             }
             // As `finish` retires a journal: out of the way first, then deleted.
@@ -1058,6 +1066,12 @@ fn check_external_changes(
             continue;
         }
         let target = root.join(&entry.path);
+        // A folder published whole: its own time moves as files are renamed
+        // into it, and its contents cannot be compared byte for byte. A folder
+        // that appeared behind us is still refused when it is published.
+        if target.is_dir() || (entry.present && journal.join(&entry.path).is_dir()) {
+            continue;
+        }
         if !written_since(&target, since)? {
             continue;
         }
@@ -2090,6 +2104,51 @@ mod tests {
 
         for p in &paths {
             assert_eq!(std::fs::read(root.path().join(p)).unwrap(), format!("audio {}", p.display()).as_bytes());
+        }
+        assert!(!journal.exists());
+    }
+
+    /// A brand-new analysis folder is published as one directory image, so
+    /// its three ANLZ files cost one rename on a FAT32 stick instead of three.
+    #[test]
+    fn a_new_directory_image_is_published_as_one_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let publication = Publication::new(root.path(), ".rbxport-publication").unwrap();
+        for name in ["a", "b", "c"] {
+            write_file(&publication.stage().join("Contents/x").join(name), name.as_bytes());
+        }
+        publication.commit(&[PathBuf::from("Contents/x")]).unwrap();
+        for name in ["a", "b", "c"] {
+            assert_eq!(std::fs::read(root.path().join("Contents/x").join(name)).unwrap(), name.as_bytes());
+        }
+        assert!(!root.path().join(".rbxport-publication").exists());
+        drop(publication);
+    }
+
+    /// The directory rename of a new analysis folder can be lost like any
+    /// other new entry's, and replay must publish the folder again.
+    #[test]
+    fn a_lost_directory_rename_replays_from_the_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join(".rbxport-publication");
+        let publication = Publication::new(root.path(), ".rbxport-publication").unwrap();
+        for name in ["a", "b", "c"] {
+            write_file(&publication.stage().join("Contents/x").join(name), name.as_bytes());
+        }
+        // Retained, so the journal and its record outlive the publication.
+        publication.commit_retained(&[PathBuf::from("Contents/x")]).unwrap();
+        drop(publication);
+        assert!(journal.join("publication.json").is_file());
+        // The rename never reached the device.
+        std::fs::rename(root.path().join("Contents/x"), journal.join("Contents/x")).unwrap();
+        let record = std::fs::read(journal.join("publication.json")).unwrap();
+        write(&journal.join("publication.json"), &record).unwrap();
+
+        Publication::recover(root.path(), ".rbxport-publication").unwrap();
+        Publication::finalize_pending(root.path(), ".rbxport-publication").unwrap();
+
+        for name in ["a", "b", "c"] {
+            assert_eq!(std::fs::read(root.path().join("Contents/x").join(name)).unwrap(), name.as_bytes());
         }
         assert!(!journal.exists());
     }

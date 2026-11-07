@@ -1975,6 +1975,9 @@ fn export_cancellable_inner(
         }
     }
     files.sort(); files.dedup();
+    // One entry for a whole new analysis directory instead of its three files.
+    let mut files = collapse_new_analysis_directories(publication.stage(), destination, files)?;
+    files.sort(); files.dedup();
     // Catch another writer changing a database while this export was staging.
     incremental::recheck();
     for (path, expected) in &full_source_hashes {
@@ -2743,6 +2746,47 @@ fn staged_files(root: &Path, named: &[&str]) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// A track analysed for the first time is published as three ANLZ files in a
+/// directory of its own: `ANLZ0000.DAT`, `.EXT` and `.2EX`. Publishing them
+/// one at a time costs one rename each, and on a FAT32 stick the renames are
+/// what publishing costs (6.2 ms a file on a disk image, more on a USB one),
+/// so a directory the stick does not have is published whole, as one entry,
+/// in one rename. A directory the stick does have keeps its per-file entries:
+/// replacing files there has an order the journal and its flushes rely on.
+fn collapse_new_analysis_directories(stage: &Path, destination: &Path, files: Vec<PathBuf>) -> std::io::Result<Vec<PathBuf>> {
+    let mut groups: BTreeMap<&Path, Vec<usize>> = BTreeMap::new();
+    for (index, path) in files.iter().enumerate() {
+        let analysis = path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("ANLZ0000."));
+        if let (true, Some(dir)) = (analysis, path.parent()) {
+            groups.entry(dir).or_default().push(index);
+        }
+    }
+    let mut collapsed = vec![false; files.len()];
+    let mut directories = Vec::new();
+    for (dir, indices) in groups {
+        if indices.len() < 2 || destination.join(dir).try_exists()? || !stage.join(dir).is_dir() {
+            continue;
+        }
+        // Every name staged there must be one of these files, or the stage
+        // would keep a file the directory image does not carry, and no other
+        // entry may name the directory or sit under it.
+        let staged = std::fs::read_dir(stage.join(dir))?.filter_map(std::result::Result::ok).count();
+        let named = files.iter().filter(|path| path.starts_with(dir)).count();
+        if staged != indices.len() || named != indices.len() {
+            continue;
+        }
+        for index in indices {
+            collapsed[index] = true;
+        }
+        directories.push(dir.to_path_buf());
+    }
+    let mut result: Vec<PathBuf> = files.into_iter().enumerate().filter(|(index, _)| !collapsed[*index]).map(|(_, path)| path).collect();
+    result.extend(directories);
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -2812,6 +2856,29 @@ mod tests {
             PathBuf::from("Contents/Bj\u{f6}rk/Album/Kes\u{e4}.mp3"),
             PathBuf::from("PIONEER/rekordbox/export.pdb"),
         ]);
+    }
+
+    #[test]
+    fn a_new_analysis_directory_is_published_as_one_entry() {
+        let stage = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let dir = Path::new("PIONEER/USBANLZ/P001/ABCDEF12");
+        for extension in ["DAT", "EXT", "2EX"] {
+            let path = stage.path().join(dir).join(format!("ANLZ0000.{extension}"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, extension.as_bytes()).unwrap();
+        }
+        let files: Vec<PathBuf> = ["DAT", "EXT", "2EX"].iter().map(|e| dir.join(format!("ANLZ0000.{e}"))).collect();
+        let collapsed = collapse_new_analysis_directories(stage.path(), destination.path(), files.clone()).unwrap();
+        assert_eq!(collapsed, vec![dir.to_path_buf()]);
+
+        // The stick already has the directory, so its files keep their own
+        // entries: a replacement has an order the journal relies on.
+        std::fs::create_dir_all(destination.path().join(dir)).unwrap();
+        let kept = collapse_new_analysis_directories(stage.path(), destination.path(), files.clone()).unwrap();
+        let mut expected = files;
+        expected.sort();
+        assert_eq!(kept, expected);
     }
 
     #[test]
